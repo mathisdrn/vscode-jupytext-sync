@@ -9,22 +9,29 @@ export type MaybeJupytext = {
   python: string
   executable: string | undefined
   jupytextVersion: string | undefined
+  isStandaloneCli?: boolean
 }
 
 export type Jupytext = {
-  python: string // might be a symlink
+  python: string // might be a symlink or "jupytext"
   executable: string
   jupytextVersion: string
+  isStandaloneCli?: boolean
 }
 
 let jupytextInfo: Jupytext | undefined = undefined
 let supportedExtensions: string[] = EXTENSIONS
 let extensionContext: vscode.ExtensionContext | undefined = undefined
+let hasWarnedInSession = false
 
 const AUTO_CREATED_NOTEBOOKS_KEY = "jupytextSync.autoCreatedNotebooks"
 
 export function setExtensionContext(context: vscode.ExtensionContext): void {
   extensionContext = context
+}
+
+export function resetWarningSession(): void {
+  hasWarnedInSession = false
 }
 
 export function markNotebookAsAutoCreated(notebookUri: vscode.Uri, logPrefix: string = ""): void {
@@ -122,36 +129,61 @@ export async function setJupytext(jupytext: Jupytext | undefined, showMessage: b
   }
 }
 
-export async function getAvailableVersions(): Promise<Jupytext[]> {
-  const pythonPaths = await getPythonPaths()
+export async function getAvailableVersions(resourceUri?: vscode.Uri): Promise<Jupytext[]> {
+  const pythonPaths = await getPythonPaths(resourceUri)
   const versions = await Promise.all(pythonPaths.map(resolveJupytext))
   let msg = "Verifying Jupytext versions:\n"
-  for (const {python, executable, jupytextVersion} of versions) {
-    msg += `Option: ${python} (${executable}) jupytext=${jupytextVersion}\n`
+  for (const {python, executable, jupytextVersion, isStandaloneCli} of versions) {
+    msg += `Option: ${python} (${executable}) jupytext=${jupytextVersion} standalone=${!!isStandaloneCli}\n`
   }
   getJConsole().appendLine(msg)
   return versions.filter((v) => v.executable && v.jupytextVersion) as Jupytext[]
 }
 
-async function runJupytextVersion(pythonPath: string) {
+async function runJupytextVersion(pythonPath: string): Promise<string | undefined> {
   try {
     const version = await runCommand([pythonPath, "-m", "jupytext", "--version"])
-    return version ?? undefined
+    return version?.trim() || undefined
   } catch (ex) {
     const msg = `Failed to run Jupytext version with ${pythonPath}: ${ex}`
-    console.error(msg, ex)
+    console.debug(msg, ex)
+    getJConsole().appendLine(msg)
+    return undefined
+  }
+}
+
+async function runJupytextVersionStandalone(): Promise<string | undefined> {
+  try {
+    const version = await runCommand(["jupytext", "--version"])
+    return version?.trim() || undefined
+  } catch (ex) {
+    const msg = `Failed to run standalone Jupytext version: ${ex}`
+    console.debug(msg, ex)
     getJConsole().appendLine(msg)
     return undefined
   }
 }
 
 export async function resolveJupytext(pythonPath: string): Promise<MaybeJupytext> {
+  if (pythonPath === "jupytext") {
+    const jupytextVersion = await runJupytextVersionStandalone()
+    if (jupytextVersion) {
+      return {
+        python: "jupytext",
+        executable: "jupytext",
+        jupytextVersion,
+        isStandaloneCli: true,
+      }
+    }
+    return {python: pythonPath, executable: undefined, jupytextVersion: undefined}
+  }
+
   const executable = await resolvePythonExecutable([pythonPath])
   if (!executable) {
     return {python: pythonPath, executable: undefined, jupytextVersion: undefined}
   }
   const jupytextVersion = await runJupytextVersion(executable)
-  return {python: pythonPath, executable, jupytextVersion}
+  return {python: pythonPath, executable, jupytextVersion, isStandaloneCli: false}
 }
 
 const injectTimestamp = (module: string, prefix: string = "") =>
@@ -176,8 +208,12 @@ export async function runJupytext(
     getJConsole().appendLine(`${logPrefix}Executing (abbreviated): ${cmdLog}`)
     // pass the cwd so that jupytext can pick up config files
     const cwd = path.dirname(cmdArgs[cmdArgs.length - 1])
-    // const cmdBase = [jupytext.executable, "-m", "jupytext"]
-    const cmdBase = [jupytext.executable, "-c", injectTimestamp("jupytext", logPrefix)]
+    let cmdBase: string[]
+    if (jupytext.isStandaloneCli) {
+      cmdBase = [jupytext.executable]
+    } else {
+      cmdBase = [jupytext.executable, "-c", injectTimestamp("jupytext", logPrefix)]
+    }
     const output = await runCommand(cmdBase.concat(cmdArgs), cwd)
     // Don't prefix with logPrefix, already done by injectTimestamp
     getJConsole().appendLine(output)
@@ -204,6 +240,9 @@ export async function importJupytextFileExtensions(): Promise<string[] | undefin
     if (!jupytext) {
       throw new Error("Jupytext not found")
     }
+    if (jupytext.isStandaloneCli) {
+      return EXTENSIONS
+    }
     const extensions = await runCommand([
       jupytext.executable,
       "-c",
@@ -214,9 +253,9 @@ export async function importJupytextFileExtensions(): Promise<string[] | undefin
     return extensionsArray
   } catch (ex) {
     const msg = `Failed to import Jupytext and the file extensions it supports: ${ex}`
-    console.error(msg, ex)
+    console.debug(msg, ex)
     getJConsole().appendLine(msg)
-    return undefined
+    return EXTENSIONS
   }
 }
 
@@ -371,17 +410,105 @@ export function makeLogPrefix(eventName: string): string {
   return `${eventName},${eventId}: `
 }
 
+export function hasWorkspaceJupytextConfig(resourceUri?: vscode.Uri): boolean {
+  const folders = resourceUri
+    ? [vscode.workspace.getWorkspaceFolder(resourceUri)].filter((f): f is vscode.WorkspaceFolder => !!f)
+    : vscode.workspace.workspaceFolders ?? []
+
+  const candidateConfigFiles = [
+    "jupytext.toml",
+    ".jupytext",
+    ".jupytext.py",
+    ".jupytext.toml",
+  ]
+
+  for (const folder of folders) {
+    for (const configFile of candidateConfigFiles) {
+      if (fs.existsSync(path.join(folder.uri.fsPath, configFile))) {
+        return true
+      }
+    }
+
+    // Check pyproject.toml for [tool.jupytext]
+    const pyprojectPath = path.join(folder.uri.fsPath, "pyproject.toml")
+    if (fs.existsSync(pyprojectPath)) {
+      try {
+        const content = fs.readFileSync(pyprojectPath, "utf8")
+        if (content.includes("[tool.jupytext]") || content.includes("tool.jupytext")) {
+          return true
+        }
+      } catch {
+        // Ignore read errors
+      }
+    }
+
+    // Check setup.cfg for [jupytext]
+    const setupCfgPath = path.join(folder.uri.fsPath, "setup.cfg")
+    if (fs.existsSync(setupCfgPath)) {
+      try {
+        const content = fs.readFileSync(setupCfgPath, "utf8")
+        if (content.includes("[jupytext]")) {
+          return true
+        }
+      } catch {
+        // Ignore read errors
+      }
+    }
+  }
+  return false
+}
+
+export function hasDocumentPairingMetadata(uri: vscode.Uri): boolean {
+  if (uri.scheme !== "file") {
+    return false
+  }
+  try {
+    const fsPath = uri.fsPath
+    if (!fs.existsSync(fsPath)) {
+      return false
+    }
+    if (fsPath.endsWith(".ipynb")) {
+      const content = fs.readFileSync(fsPath, "utf8")
+      return content.includes('"jupytext"')
+    } else {
+      // Read first ~4KB of text file
+      const fd = fs.openSync(fsPath, "r")
+      const buffer = Buffer.alloc(4096)
+      const bytesRead = fs.readSync(fd, buffer, 0, 4096, 0)
+      fs.closeSync(fd)
+      const headerText = buffer.toString("utf8", 0, bytesRead)
+      return (
+        (headerText.includes("jupytext:") && headerText.includes("formats:")) ||
+        (headerText.includes("jupyter:") && headerText.includes("jupytext:"))
+      )
+    }
+  } catch {
+    return false
+  }
+}
+
 export async function handleDocument(document: vscode.TextDocument | vscode.NotebookDocument, eventName: string) {
   const logPrefix = makeLogPrefix(eventName)
-  const jupytext = getJupytext()
-  if (!jupytext) {
-    const msg = `${logPrefix}Jupytext not set`
-    getJConsole().appendLine(msg)
+  if (!isSupportedFile(document.uri) || document.uri.scheme !== "file") {
     return
   }
-  if (isSupportedFile(document.uri) && document.uri.scheme === "file") {
-    return await runJupytextSync(document.uri, true, logPrefix)
+
+  let jupytext = getJupytext()
+  if (!jupytext) {
+    const isPaired = hasDocumentPairingMetadata(document.uri)
+    const hasConfig = hasWorkspaceJupytextConfig(document.uri)
+    if (isPaired || hasConfig) {
+      await validatePythonAndJupytext({reason: "document_sync", resourceUri: document.uri})
+      jupytext = getJupytext()
+    }
+    if (!jupytext) {
+      const msg = `${logPrefix}Jupytext not set, skipping sync for ${document.uri.fsPath}`
+      getJConsole().appendLine(msg)
+      return
+    }
   }
+
+  return await runJupytextSync(document.uri, true, logPrefix)
 }
 
 export async function getFileUri(fileUri?: vscode.Uri) {
@@ -488,6 +615,13 @@ export async function setFormats(
 // into setFormats' arguments.
 export async function pair(fileUri?: vscode.Uri) {
   const logPrefix = makeLogPrefix("Pair")
+  const jupytext = getJupytext()
+  if (!jupytext) {
+    await validatePythonAndJupytext({reason: "command", resourceUri: fileUri})
+    if (!getJupytext()) {
+      return
+    }
+  }
   return await setFormats(fileUri, config().get<boolean>("askFormats.onPairDocuments", true), false, logPrefix)
 }
 
@@ -517,8 +651,9 @@ export async function readPairedPathsAndFormatsInternal(
   try {
     // for options affecting jupytext based on config files
     const cwd = path.dirname(fileUri.fsPath)
+    const pythonExe = jupytext.isStandaloneCli ? "python3" : jupytext.executable
     // Will be empty JSON list if file has no paired formats
-    const formatsStr = await runCommand([jupytext.executable, "-c", py], cwd)
+    const formatsStr = await runCommand([pythonExe, "-c", py], cwd)
     let msg = `${logPrefix}Read paired paths and formats for ${fileUri}: ${formatsStr}`
     getJConsole().appendLine(msg)
     return JSON.parse(formatsStr) as PairedPathAndFormat[]
@@ -572,6 +707,15 @@ export async function openPairedNotebook(
     return
   }
 
+  let jupytext = getJupytext()
+  if (!jupytext) {
+    await validatePythonAndJupytext({reason: "command", resourceUri: uri})
+    jupytext = getJupytext()
+    if (!jupytext) {
+      return
+    }
+  }
+
   progress?.report({message: "Determining notebook path"})
   let notebookUri: vscode.Uri | undefined = undefined
 
@@ -611,8 +755,6 @@ export async function openPairedNotebook(
 
   try {
     progress?.report({message: "Opening"})
-    // This did not seem to work
-    // await vscode.workspace.openNotebookDocument(notebookUri)
     await vscode.commands.executeCommand("vscode.openWith", notebookUri, "jupyter-notebook")
     return
   } catch (ex) {
@@ -676,61 +818,102 @@ export function sortVersions(versions: Jupytext[]) {
   return versions.sort((vA, vB) => compareVersions(vA.jupytextVersion, vB.jupytextVersion))
 }
 
-export async function pickJupytext(): Promise<Jupytext | undefined> {
+export async function pickJupytext(resourceUri?: vscode.Uri): Promise<Jupytext | undefined> {
   const msg = "Attempting to pick a python executable and Jupytext automatically"
   getJConsole().appendLine(msg)
-  const sorted = sortVersions(await getAvailableVersions())
-  return sorted[sorted.length - 1] ?? undefined
+  const versions = await getAvailableVersions(resourceUri)
+  const validVersions = versions.filter((v) => compareVersions(v.jupytextVersion, "1.17.3") >= 0)
+  // Candidate list is ordered by priority (active workspace env -> local .venv -> extensions -> standalone CLI -> system)
+  return validVersions[0] ?? undefined
 }
 
 export async function locatePythonAndJupytext() {
   getJConsole().appendLine("Starting Python and Jupytext discovery...")
-  const jupytext = await pickJupytext()
-  if (jupytext) {
-    setJupytext(jupytext, true)
-  } else {
-    const messageSettings =
-      "Failed to automatically locate a python executable that can invoke Jupytext. " +
-      "Click 'Open Settings' and specify the Python Executable. " +
-      "There you will find more detailed instructions and tips. " +
-      "If you still have issues, click 'Show Logs' for more information or " +
-      "create an issue on [GitHub](https://github.com/caenrigen/vscode-jupytext-sync/issues)."
-    const selection = await vscode.window.showWarningMessage(messageSettings, "Open Settings", "Show Logs")
-    if (selection === "Open Settings") {
-      // no need to await
-      vscode.commands.executeCommand("workbench.action.openSettings", "jupytextSync.pythonExecutable")
-    } else if (selection === "Show Logs") {
-      getJConsole().show()
-    }
-  }
+  await validatePythonAndJupytext({reason: "command"})
 }
 
-export async function validatePythonAndJupytext() {
+export type ValidateOptions = {
+  reason?: "startup" | "config_change" | "command" | "document_sync" | "env_change"
+  resourceUri?: vscode.Uri
+  silent?: boolean
+}
+
+export async function validatePythonAndJupytext(options: ValidateOptions = {}) {
+  const {reason = "startup", resourceUri, silent = false} = options
+  getJConsole().appendLine(`Validating Python and Jupytext (reason: ${reason})...`)
+
   setJupytext(undefined, false) // reset runtime jupytext
-  let pythonPath = getPythonFromConfig()
-  let findAutomatically = false
+  const pythonPath = getPythonFromConfig()
+
   if (pythonPath) {
     const jupytext = await resolveJupytext(pythonPath)
     if (jupytext.executable && jupytext.jupytextVersion) {
-      setJupytext(jupytext as Jupytext, false)
+      await setJupytext(jupytext as Jupytext, reason === "command")
     } else {
-      const msg =
-        `Could not invoke Jupytext with the python executable '${pythonPath}'. ` +
-        'You can attempt to find a suitable python executable by clicking "Find automatically" or ' +
-        '"Open Settings" to specify the Python Executable manually.'
-      console.warn(msg)
+      const msg = `Could not invoke Jupytext with the configured python executable '${pythonPath}'.`
       getJConsole().appendLine(msg)
-      const selection = await vscode.window.showWarningMessage(msg, "Find automatically", "Open Settings")
-      if (selection === "Find automatically") {
-        findAutomatically = true
+      if (reason === "command" || reason === "config_change" || (!silent && hasWorkspaceJupytextConfig(resourceUri))) {
+        const selection = await vscode.window.showWarningMessage(
+          `${msg} You can select a Python interpreter or open settings to configure it.`,
+          "Select Python Interpreter",
+          "Open Settings",
+          "Show Logs",
+        )
+        if (selection === "Select Python Interpreter") {
+          vscode.commands.executeCommand("python.setInterpreter")
+        } else if (selection === "Open Settings") {
+          vscode.commands.executeCommand("workbench.action.openSettings", "jupytextSync.pythonExecutable")
+        } else if (selection === "Show Logs") {
+          getJConsole().show()
+        }
+      }
+    }
+    await vscode.commands.executeCommand("setContext", "jupytextSync.supportedExtensions", getSupportedExtensions())
+    return
+  }
+
+  // Automatic discovery
+  const jupytext = await pickJupytext(resourceUri)
+  if (jupytext) {
+    await setJupytext(jupytext, reason === "command")
+  } else {
+    const msg = "Failed to automatically locate a Python executable or standalone binary that can invoke Jupytext."
+    getJConsole().appendLine(msg)
+
+    // Determine whether to display a notification
+    const shouldWarn =
+      reason === "command" ||
+      (reason === "startup" && hasWorkspaceJupytextConfig(resourceUri)) ||
+      (reason === "document_sync" && !hasWarnedInSession && (hasDocumentPairingMetadata(resourceUri!) || hasWorkspaceJupytextConfig(resourceUri)))
+
+    if (shouldWarn && !silent) {
+      hasWarnedInSession = true
+      let promptTitle =
+        "Failed to automatically locate a Python executable that can invoke Jupytext. " +
+        "Click 'Open Settings' and specify the Python Executable, or select a Python interpreter."
+      if (reason === "startup") {
+        promptTitle =
+          "Jupytext configuration was detected in this workspace, but Jupytext could not be located in your Python environment."
+      } else if (reason === "document_sync") {
+        promptTitle =
+          "A paired Jupytext document was detected, but Jupytext is not installed in the active Python environment."
+      }
+
+      const selection = await vscode.window.showWarningMessage(
+        promptTitle,
+        "Select Python Interpreter",
+        "Open Settings",
+        "Show Logs",
+      )
+      if (selection === "Select Python Interpreter") {
+        vscode.commands.executeCommand("python.setInterpreter")
       } else if (selection === "Open Settings") {
         vscode.commands.executeCommand("workbench.action.openSettings", "jupytextSync.pythonExecutable")
+      } else if (selection === "Show Logs") {
+        getJConsole().show()
       }
     }
   }
-  // First launch (or bad python/jupytext), try to set it automatically
-  if (!pythonPath || findAutomatically) {
-    await locatePythonAndJupytext()
-  }
+
   await vscode.commands.executeCommand("setContext", "jupytextSync.supportedExtensions", getSupportedExtensions())
 }

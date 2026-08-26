@@ -1,5 +1,13 @@
 # Change Log
 
+## 1.4.5 2026-08-26
+
+- **Silent Startup & Targeted Warnings**: Fail silently without intrusive popups on startup when opening folders that do not use Jupytext. Proactively warn only when workspace Jupytext configs (`jupytext.toml`, `pyproject.toml`, `setup.cfg`) or paired files are detected (#9, #32, #41, #43).
+- **Multi-Tier Environment Discovery**:
+  - Support `ms-python.vscode-python-envs` (Python Environments) and `ms-python.python` extensions with automatic re-validation when the active environment changes (#39).
+  - Direct zero-dependency workspace `.venv`, `venv`, `env`, `.conda`, and `.pixi` scanner (works reliably on VSCodium / forks without external extensions, #23).
+  - Support standalone `jupytext` CLI binary on `$PATH` (installed via `uv tool install jupytext`, `pipx`, `brew`, #40).
+
 ## 1.4.4 2026-03-02
 
 - Support ${userHome} and ${env:VAR_NAME} in `jupytextSync.pythonExecutable` setting by [@alxhslm](https://github.com/alxhslm).

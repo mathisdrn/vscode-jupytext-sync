@@ -83,15 +83,20 @@ This extension solves several common annoyances and provides handy features for 
 You can configure the extension's behavior via VSCode settings (search for `jupytextSync` in the Settings UI or edit your `settings.json`):
 
 - **`jupytextSync.pythonExecutable`**:
-  - **Description**: The path to the Python executable used to invoke `jupytext`.
-  - **Details**: Jupytext Sync requires a Python executable with the `jupytext` package installed.
-    - _Automatic discovery_: If not specified, the extension attempts to find a suitable Python executable. If the Microsoft Python extension is installed, its selected interpreter and other known environments are checked. Otherwise, it looks for `python` and `python3` in your system `$PATH`. The one providing the highest `jupytext` version is preferred. If auto-detection fails, a warning message is displayed prompting you to manually configure this setting.
-    - _Manual override_: Specify an absolute path or a command (e.g., `python3`). If using a command, ensure your VS Code instance inherits the correct `$PATH` (launching from an activated terminal might be necessary for virtual environments).
+  - **Description**: The path to the Python executable or standalone CLI used to invoke `jupytext`.
+  - **Details**: Jupytext Sync requires a Python executable with the `jupytext` package installed or a standalone `jupytext` binary.
+    - _Automatic discovery_: If not specified, the extension attempts to find a suitable executable using a multi-tier resolution strategy:
+      1. Active Python environment in the workspace from [`ms-python.vscode-python-envs`](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-python-envs) or [`ms-python.python`](https://marketplace.visualstudio.com/items?itemName=ms-python.python) (re-validating automatically when the active interpreter changes).
+      2. Local workspace virtual environments (`.venv`, `venv`, `env`, `.conda`, `.pixi`).
+      3. Standalone `jupytext` CLI on `$PATH` (e.g., installed via `uv tool install jupytext`, `pipx`, or `brew`).
+      4. Discovered environments from installed Python extensions, followed by system `python3`/`python` on `$PATH`.
+    - _Silent startup & targeted warnings_: Discovery runs silently on startup without intrusive popups unless the workspace contains Jupytext configuration files (`jupytext.toml`, `pyproject.toml`, `setup.cfg`) or paired documents.
+    - _Manual override_: Specify an absolute path or command (e.g., `python3` or `jupytext`).
     - _Variable expansion_: The setting supports variable expansion for portability:
       - `${userHome}`: Expands to the user's home directory
       - `${env:VAR_NAME}`: Expands to the value of environment variable `VAR_NAME`
       - `${workspaceFolder}`: Expands to the workspace folder path
-  - **Tip**: Use the "**Jupytext: Show Jupytext Sync Logs**" or "**Jupytext: Locate Python and Jupytext**" commands to verify which Python executable is being used.
+  - **Tip**: Use the "**Jupytext: Show Jupytext Sync Logs**" or "**Jupytext: Locate Python and Jupytext**" commands to verify which executable is being used.
   - **Default**: `""` (empty string, for automatic discovery)
 
 - **`jupytextSync.deleteOnNotebookClose`**:

@@ -1,8 +1,6 @@
 import * as vscode from "vscode"
 import {getJConsole, config, setConfig} from "./constants"
 import {
-  pickJupytext,
-  setJupytext,
   getFileUri,
   handleDocument,
   openPairedNotebookCommand,
@@ -18,6 +16,7 @@ import {
   locatePythonAndJupytext,
 } from "./jupytext"
 import {PairedNotebookEditorProvider} from "./pairedNotebookEditor"
+import {subscribeToPythonEnvChanges} from "./python"
 
 // Store disposables for event handlers so we can manage them
 let disposables: vscode.Disposable[] = []
@@ -42,7 +41,7 @@ export async function activate(context: vscode.ExtensionContext) {
         await updateEventHandlers(context)
       }
       if (e.affectsConfiguration("jupytextSync.pythonExecutable")) {
-        await validatePythonAndJupytext()
+        await validatePythonAndJupytext({reason: "config_change"})
       }
     }),
   )
@@ -79,9 +78,14 @@ export async function activate(context: vscode.ExtensionContext) {
   // Register custom editor provider for paired notebooks
   context.subscriptions.push(PairedNotebookEditorProvider.register(context))
 
-  // Validate Python and Jupytext on extension activation so that we have an updated
-  // list of supported extensions
-  await validatePythonAndJupytext()
+  // Subscribe to Python environment changes (both ms-python.vscode-python-envs and ms-python.python)
+  await subscribeToPythonEnvChanges(context, async (reason) => {
+    getJConsole().appendLine(`${reason}, re-validating environment...`)
+    await validatePythonAndJupytext({reason: "env_change"})
+  })
+
+  // Validate Python and Jupytext on startup (warns only if workspace has Jupytext configs or pairing rules)
+  await validatePythonAndJupytext({reason: "startup"})
 
   // Initial setup of handlers based on current configuration
   await updateEventHandlers(context)
