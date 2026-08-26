@@ -1,6 +1,12 @@
 import * as vscode from "vscode"
 import {config, defaultNotebookDir, EXTENSIONS} from "./constants"
-import {getPythonPaths, runCommand, resolvePythonExecutable, getPythonFromConfig} from "./python"
+import {
+  getPythonPaths,
+  runCommand,
+  resolvePythonExecutable,
+  getPythonFromConfig,
+  findWorkspaceVirtualenvs,
+} from "./python"
 import {getJConsole} from "./constants"
 import * as path from "path"
 import * as fs from "fs"
@@ -140,10 +146,18 @@ export async function getAvailableVersions(resourceUri?: vscode.Uri): Promise<Ju
   return versions.filter((v) => v.executable && v.jupytextVersion) as Jupytext[]
 }
 
+function extractSemver(versionOutput: string | undefined): string | undefined {
+  if (!versionOutput) {
+    return undefined
+  }
+  const match = versionOutput.match(/\d+\.\d+\.\d+(?:rc\d*)?/)
+  return match ? match[0] : undefined
+}
+
 async function runJupytextVersion(pythonPath: string): Promise<string | undefined> {
   try {
     const version = await runCommand([pythonPath, "-m", "jupytext", "--version"])
-    return version?.trim() || undefined
+    return extractSemver(version)
   } catch (ex) {
     const msg = `Failed to run Jupytext version with ${pythonPath}: ${ex}`
     console.debug(msg, ex)
@@ -155,7 +169,7 @@ async function runJupytextVersion(pythonPath: string): Promise<string | undefine
 async function runJupytextVersionStandalone(): Promise<string | undefined> {
   try {
     const version = await runCommand(["jupytext", "--version"])
-    return version?.trim() || undefined
+    return extractSemver(version)
   } catch (ex) {
     const msg = `Failed to run standalone Jupytext version: ${ex}`
     console.debug(msg, ex)
@@ -467,16 +481,16 @@ export function hasDocumentPairingMetadata(uri: vscode.Uri): boolean {
     if (!fs.existsSync(fsPath)) {
       return false
     }
+    // Read only the initial chunk (~8KB) to avoid loading entire large notebooks into memory
+    const fd = fs.openSync(fsPath, "r")
+    const buffer = Buffer.alloc(8192)
+    const bytesRead = fs.readSync(fd, buffer, 0, 8192, 0)
+    fs.closeSync(fd)
+    const headerText = buffer.toString("utf8", 0, bytesRead)
+
     if (fsPath.endsWith(".ipynb")) {
-      const content = fs.readFileSync(fsPath, "utf8")
-      return content.includes('"jupytext"')
+      return headerText.includes('"jupytext"')
     } else {
-      // Read first ~4KB of text file
-      const fd = fs.openSync(fsPath, "r")
-      const buffer = Buffer.alloc(4096)
-      const bytesRead = fs.readSync(fd, buffer, 0, 4096, 0)
-      fs.closeSync(fd)
-      const headerText = buffer.toString("utf8", 0, bytesRead)
       return (
         (headerText.includes("jupytext:") && headerText.includes("formats:")) ||
         (headerText.includes("jupyter:") && headerText.includes("jupytext:"))
@@ -628,6 +642,24 @@ export async function pair(fileUri?: vscode.Uri) {
 export type PairedFormat = {extension: string; format_name?: string}
 export type PairedPathAndFormat = [string, PairedFormat]
 
+async function runPairedPathsScript(
+  pythonCandidates: string[],
+  pyScript: string,
+  cwd: string,
+): Promise<string | undefined> {
+  for (const pyExe of pythonCandidates) {
+    try {
+      const output = await runCommand([pyExe, "-c", pyScript], cwd)
+      if (output && output.trim().length > 0) {
+        return output
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return undefined
+}
+
 // Internal implementation - reads paired formats without queuing
 // Export for use within other queued operations to avoid nested queuing
 export async function readPairedPathsAndFormatsInternal(
@@ -651,9 +683,17 @@ export async function readPairedPathsAndFormatsInternal(
   try {
     // for options affecting jupytext based on config files
     const cwd = path.dirname(fileUri.fsPath)
-    const pythonExe = jupytext.isStandaloneCli ? "python3" : jupytext.executable
-    // Will be empty JSON list if file has no paired formats
-    const formatsStr = await runCommand([pythonExe, "-c", py], cwd)
+    const pythonCandidates = jupytext.isStandaloneCli
+      ? [
+          ...findWorkspaceVirtualenvs(fileUri),
+          ...(process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python"]),
+        ]
+      : [jupytext.executable]
+
+    const formatsStr = await runPairedPathsScript(pythonCandidates, py, cwd)
+    if (!formatsStr) {
+      throw new Error("Could not execute paired paths helper with any available Python runner.")
+    }
     let msg = `${logPrefix}Read paired paths and formats for ${fileUri}: ${formatsStr}`
     getJConsole().appendLine(msg)
     return JSON.parse(formatsStr) as PairedPathAndFormat[]
@@ -823,7 +863,7 @@ export async function pickJupytext(resourceUri?: vscode.Uri): Promise<Jupytext |
   getJConsole().appendLine(msg)
   const versions = await getAvailableVersions(resourceUri)
   const validVersions = versions.filter((v) => compareVersions(v.jupytextVersion, "1.17.3") >= 0)
-  // Candidate list is ordered by priority (active workspace env -> local .venv -> extensions -> standalone CLI -> system)
+  // Candidate list is ordered by priority (active workspace env -> local .venv -> standalone CLI -> other envs -> system)
   return validVersions[0] ?? undefined
 }
 
@@ -884,7 +924,9 @@ export async function validatePythonAndJupytext(options: ValidateOptions = {}) {
     const shouldWarn =
       reason === "command" ||
       (reason === "startup" && hasWorkspaceJupytextConfig(resourceUri)) ||
-      (reason === "document_sync" && !hasWarnedInSession && (hasDocumentPairingMetadata(resourceUri!) || hasWorkspaceJupytextConfig(resourceUri)))
+      (reason === "document_sync" &&
+        !hasWarnedInSession &&
+        ((resourceUri && hasDocumentPairingMetadata(resourceUri)) || hasWorkspaceJupytextConfig(resourceUri)))
 
     if (shouldWarn && !silent) {
       hasWarnedInSession = true

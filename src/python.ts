@@ -72,8 +72,7 @@ export async function runCommand(cmdArgs: string[], cwd?: string): Promise<strin
   let spawnEnv = {cwd: cwd || ".", env}
 
   const cmdStr = `${cmd} ${args.join(" ")}`
-  const msg = `Executing: ${cmdStr}`
-  console.debug(msg)
+  console.debug(`Executing: ${cmdStr}`)
   const proc = spawn(cmd, args, spawnEnv)
   let stdout = ""
   let stderr = ""
@@ -117,11 +116,36 @@ export async function runCommand(cmdArgs: string[], cwd?: string): Promise<strin
   })
 }
 
-async function getPythonPathsViaNewPythonEnvs(resourceUri?: vscode.Uri): Promise<string[]> {
-  const msgPrefix = "Skipping Python discovery via ms-python.vscode-python-envs extension"
+async function getActiveWorkspaceEnvsViaNewPythonEnvs(resourceUri?: vscode.Uri): Promise<string[]> {
   const api = await getNewPythonEnvsApi()
   if (!api) {
-    getJConsole().appendLine(`${msgPrefix}: not installed.`)
+    return []
+  }
+  try {
+    const paths: string[] = []
+    const targetFolder = resourceUri
+      ? vscode.workspace.getWorkspaceFolder(resourceUri)?.uri
+      : vscode.workspace.workspaceFolders?.[0]?.uri
+    if (targetFolder) {
+      const active = await api.getEnvironment(targetFolder)
+      const exe = active?.execInfo?.run?.executable
+      if (exe && !active?.error) {
+        getJConsole().appendLine(
+          `ms-python.vscode-python-envs: workspace active env: ${exe}`,
+        )
+        paths.push(exe)
+      }
+    }
+    return paths
+  } catch (ex) {
+    getJConsole().appendLine(`ms-python.vscode-python-envs active env query failed: ${ex}`)
+    return []
+  }
+}
+
+async function getGlobalAndOtherEnvsViaNewPythonEnvs(): Promise<string[]> {
+  const api = await getNewPythonEnvsApi()
+  if (!api) {
     return []
   }
   try {
@@ -132,79 +156,60 @@ async function getPythonPathsViaNewPythonEnvs(resourceUri?: vscode.Uri): Promise
         paths.push(exe)
       }
     }
-    // Prefer the selected environment for the current workspace folder / active file (highest signal)
-    const targetFolder = resourceUri
-      ? vscode.workspace.getWorkspaceFolder(resourceUri)?.uri
-      : vscode.workspace.workspaceFolders?.[0]?.uri
-    if (targetFolder) {
-      const active = await api.getEnvironment(targetFolder)
-      if (active) {
-        getJConsole().appendLine(
-          `ms-python.vscode-python-envs: workspace active env: ${active.execInfo?.run?.executable ?? "(no executable)"}${active.error ? ` [broken: ${active.error}]` : ""}`,
-        )
-        addEnvPath(active)
-      }
-    }
-    // Fall back to the globally-selected environment
+    // Global active environment
     const globalActive = await api.getEnvironment(undefined)
     if (globalActive) {
-      getJConsole().appendLine(
-        `ms-python.vscode-python-envs: global active env: ${globalActive.execInfo?.run?.executable ?? "(no executable)"}${globalActive.error ? ` [broken: ${globalActive.error}]` : ""}`,
-      )
       addEnvPath(globalActive)
     }
-    // Discovered environments, skipping broken ones
+    // All other discovered environments, skipping broken ones
     const all = await api.getEnvironments("all")
     for (const env of all) {
       addEnvPath(env)
     }
-    getJConsole().appendLine(
-      `ms-python.vscode-python-envs: resolved ${paths.length} candidate path(s): ${paths.join(", ") || "(none)"}`,
-    )
     return paths
   } catch (ex) {
-    const msg = `${msgPrefix}: failed: ${ex}`
-    console.error(msg, ex)
-    getJConsole().appendLine(msg)
+    getJConsole().appendLine(`ms-python.vscode-python-envs discovery query failed: ${ex}`)
     return []
   }
 }
 
-async function getPythonPathsViaMsPython(resourceUri?: vscode.Uri): Promise<string[]> {
+async function getActiveEnvViaMsPython(resourceUri?: vscode.Uri): Promise<string[]> {
   const pythonExt = vscode.extensions.getExtension<PythonExtension>("ms-python.python")
-  const msgPrefix = "Skipping Python discovery via ms-python.python extension"
   if (!pythonExt) {
-    getJConsole().appendLine(`${msgPrefix}: not installed.`)
     return []
   }
-
-  let pythonApi: PythonExtension
   try {
-    pythonApi = pythonExt.isActive ? pythonExt.exports : await pythonExt.activate()
-  } catch (ex) {
-    const msg = `${msgPrefix}, failed to activate: ${ex}`
-    console.error(msg, ex)
-    getJConsole().appendLine(msg)
-    return []
-  }
-
-  const paths: string[] = []
-  try {
+    const pythonApi = pythonExt.isActive ? pythonExt.exports : await pythonExt.activate()
     const targetUri = resourceUri ?? vscode.workspace.workspaceFolders?.[0]?.uri
     const activeEnvPath = pythonApi.environments.getActiveEnvironmentPath(targetUri)
     if (activeEnvPath?.path) {
-      paths.push(activeEnvPath.path)
+      return [activeEnvPath.path]
     }
+  } catch (ex) {
+    getJConsole().appendLine(`ms-python.python active env query failed: ${ex}`)
+  }
+  return []
+}
+
+async function getOtherEnvsViaMsPython(): Promise<string[]> {
+  const pythonExt = vscode.extensions.getExtension<PythonExtension>("ms-python.python")
+  if (!pythonExt) {
+    return []
+  }
+  try {
+    const pythonApi = pythonExt.isActive ? pythonExt.exports : await pythonExt.activate()
+    const paths: string[] = []
     const knownEnvs = pythonApi.environments.known
     for (const env of knownEnvs) {
       if (env.path && !paths.includes(env.path)) {
         paths.push(env.path)
       }
     }
+    return paths
   } catch (ex) {
-    getJConsole().appendLine(`${msgPrefix}: error querying environments: ${ex}`)
+    getJConsole().appendLine(`ms-python.python known envs query failed: ${ex}`)
   }
-  return paths
+  return []
 }
 
 export function findWorkspaceVirtualenvs(resourceUri?: vscode.Uri): string[] {
@@ -251,28 +256,42 @@ export async function findStandaloneJupytext(): Promise<string[]> {
 }
 
 function getSystemPythonPaths(): string[] {
-  return ["python", "python3"]
+  return process.platform === "win32" ? ["python", "python3", "py"] : ["python3", "python"]
 }
 
 export async function getPythonPaths(resourceUri?: vscode.Uri): Promise<string[]> {
   const pythonConfigPath = config("python").get<string>("defaultInterpreterPath")
-  const newEnvsPaths = await getPythonPathsViaNewPythonEnvs(resourceUri)
-  const msPythonPaths = await getPythonPathsViaMsPython(resourceUri)
+
+  // Priority 1: Active workspace environments from extensions
+  const activeWorkspaceNewEnvs = await getActiveWorkspaceEnvsViaNewPythonEnvs(resourceUri)
+  const activeWorkspaceMsPython = await getActiveEnvViaMsPython(resourceUri)
+
+  // Priority 2: Direct workspace virtualenvs (.venv, venv, etc.)
   const workspaceVenvs = findWorkspaceVirtualenvs(resourceUri)
+
+  // Priority 3: Standalone Jupytext CLI on PATH (uv tool, pipx, brew)
   const standaloneCli = await findStandaloneJupytext()
+
+  // Priority 4: Other discovered extension environments (global active, all discovered)
+  const otherNewEnvs = await getGlobalAndOtherEnvsViaNewPythonEnvs()
+  const otherMsPythonEnvs = await getOtherEnvsViaMsPython()
+
+  // Priority 5: System PATH python & settings fallback
   const systemPaths = getSystemPythonPaths()
 
   const orderedCandidates = [
-    ...newEnvsPaths,
-    ...msPythonPaths,
+    ...activeWorkspaceNewEnvs,
+    ...activeWorkspaceMsPython,
     ...workspaceVenvs,
     ...standaloneCli,
+    ...otherNewEnvs,
+    ...otherMsPythonEnvs,
     ...systemPaths,
     ...(pythonConfigPath ? [pythonConfigPath] : []),
   ]
 
   const uniquePaths = Array.from(new Set(orderedCandidates))
-  console.debug("Resolved candidate python / jupytext paths:", uniquePaths)
+  console.debug("Resolved candidate python / jupytext paths (ordered):", uniquePaths)
   return uniquePaths
 }
 
